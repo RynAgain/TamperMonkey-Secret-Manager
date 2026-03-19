@@ -14,12 +14,25 @@ use crate::api::routes::{self, ApiState};
 use crate::error::ApiError;
 use crate::state::AppState;
 
-/// Start the local HTTP API server on a random port bound to `127.0.0.1`.
+/// Default port the local API server tries to bind to.
 ///
-/// A fresh bearer token is generated on every launch and persisted to
-/// `{app_data_dir}/tampermonkey-secrets/api.token` so that TamperMonkey
-/// scripts can read it.  The assigned port is likewise written to
-/// `api.port`.
+/// Using a fixed, memorable port means TamperMonkey scripts only need to
+/// configure the bearer token once -- the port stays the same across
+/// application restarts.  If the port is already in use (e.g. another
+/// instance is running) the server falls back to an OS-assigned random port.
+const DEFAULT_PORT: u16 = 17179;
+
+/// Start the local HTTP API server bound to `127.0.0.1`.
+///
+/// **Token persistence:** If a bearer token already exists on disk (from a
+/// previous launch) it is reused so that TamperMonkey scripts do not need
+/// to be reconfigured.  A new token is only generated on the very first
+/// launch or after an explicit rotation via the `rotate_api_token` command.
+///
+/// **Port stability:** The server first attempts to bind to the fixed
+/// [`DEFAULT_PORT`].  Only if that port is unavailable does it fall back
+/// to an OS-assigned random port.  The assigned port is always written to
+/// `{app_data_dir}/tampermonkey-secrets/api.port`.
 ///
 /// The server is spawned onto the Tokio runtime and runs in the
 /// background for the lifetime of the application.
@@ -27,9 +40,19 @@ pub async fn start_api_server(
     app_state: Arc<AppState>,
     app_data_dir: PathBuf,
 ) -> Result<u16, ApiError> {
-    // -- Generate and persist bearer token --
-    let token = auth::generate_token();
-    auth::save_token(&app_data_dir, &token)?;
+    // -- Resolve bearer token: reuse existing or generate fresh ----------
+    let token = match auth::load_token(&app_data_dir)? {
+        Some(existing) => {
+            println!("[API] reusing existing bearer token from disk");
+            existing
+        }
+        None => {
+            let fresh = auth::generate_token();
+            auth::save_token(&app_data_dir, &fresh)?;
+            println!("[API] generated new bearer token");
+            fresh
+        }
+    };
 
     // Store token in AppState so the UI can expose it
     {
@@ -80,11 +103,28 @@ pub async fn start_api_server(
             rate_limit::rate_limit_middleware,
         ));
 
-    // -- Bind to 127.0.0.1:0 (OS-assigned random port) --
-    let addr = SocketAddr::from(([127, 0, 0, 1], 0u16));
-    let listener = TcpListener::bind(addr)
-        .await
-        .map_err(|e| ApiError::ServerError(format!("Failed to bind: {e}")))?;
+    // -- Bind: try fixed port first, fall back to random -----------------
+    let listener = {
+        let preferred = SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT));
+        match TcpListener::bind(preferred).await {
+            Ok(l) => {
+                println!("[API] bound to preferred port {DEFAULT_PORT}");
+                l
+            }
+            Err(_) => {
+                // Port busy -- fall back to OS-assigned random port
+                let fallback = SocketAddr::from(([127, 0, 0, 1], 0u16));
+                let l = TcpListener::bind(fallback)
+                    .await
+                    .map_err(|e| ApiError::ServerError(format!("Failed to bind: {e}")))?;
+                println!(
+                    "[API] port {DEFAULT_PORT} busy, bound to fallback port {}",
+                    l.local_addr().map(|a| a.port()).unwrap_or(0)
+                );
+                l
+            }
+        }
+    };
 
     let local_addr = listener
         .local_addr()

@@ -41,6 +41,12 @@ pub fn run() {
                 *db_guard = Some(database);
             }
 
+            // Store the app handle so the HTTP API can emit events to the frontend
+            {
+                let mut handle_guard = app_state.app_handle.lock().expect("Failed to lock app_handle mutex");
+                *handle_guard = Some(app.handle().clone());
+            }
+
             // Give Tauri a clone of the Arc (commands receive State<'_, Arc<AppState>>)
             app.manage(Arc::clone(&app_state));
 

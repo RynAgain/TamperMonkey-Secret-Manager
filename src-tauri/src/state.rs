@@ -29,6 +29,9 @@ pub struct AppState {
     pub auto_lock_minutes: Mutex<u32>,
     /// Timestamp of the last successful IPC activity. Used for auto-lock.
     pub last_activity: Mutex<Option<Instant>>,
+    /// Tauri app handle, used to emit events to the frontend from the HTTP
+    /// API server (e.g. when a script requests access to an unapproved secret).
+    pub app_handle: Mutex<Option<tauri::AppHandle>>,
 }
 
 impl AppState {
@@ -43,6 +46,7 @@ impl AppState {
             app_data_dir: Mutex::new(None),
             auto_lock_minutes: Mutex::new(15),
             last_activity: Mutex::new(None),
+            app_handle: Mutex::new(None),
         }
     }
 

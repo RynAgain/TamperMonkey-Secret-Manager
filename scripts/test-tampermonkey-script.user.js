@@ -19,7 +19,7 @@
 
     // -- Persistent config via GM storage --
     let CONFIG = {
-        port: GM_getValue('tm_sm_port', ''),
+        port: GM_getValue('tm_sm_port', '17179'),
         token: GM_getValue('tm_sm_token', ''),
     };
 

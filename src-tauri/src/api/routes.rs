@@ -5,11 +5,30 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use tauri::Emitter;
 use zeroize::Zeroize;
 
 use crate::api::auth::constant_time_eq;
 use crate::crypto::encryption;
 use crate::state::AppState;
+
+/// Payload emitted to the frontend when a script requests access to a secret
+/// it has not yet been approved for.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccessRequestEvent {
+    pub script_id: String,
+    pub script_name: String,
+    pub secret_name: String,
+}
+
+/// Payload emitted to the frontend when a new unapproved script registers
+/// (either via `/api/register` or auto-registration on secret fetch).
+#[derive(Debug, Clone, Serialize)]
+pub struct ScriptPendingEvent {
+    pub script_id: String,
+    pub script_name: String,
+    pub domain: String,
+}
 
 /// Shared state passed to every Axum handler.
 ///
@@ -159,6 +178,18 @@ pub async fn get_secret_api(
                 // Auto-register as unapproved
                 let _ = db.register_script(&body.script_id, &body.script_id, &body.domain);
                 let _ = db.log_event("script_auto_registered", Some(&body.script_id), Some(&name));
+
+                // Notify frontend about the new pending script
+                if let Ok(handle_guard) = app.app_handle.lock() {
+                    if let Some(ref handle) = *handle_guard {
+                        let _ = handle.emit("script-pending-approval", ScriptPendingEvent {
+                            script_id: body.script_id.clone(),
+                            script_name: body.script_id.clone(),
+                            domain: body.domain.clone(),
+                        });
+                    }
+                }
+
                 return Err(StatusCode::FORBIDDEN);
             }
         };
@@ -187,6 +218,18 @@ pub async fn get_secret_api(
                     // No record -- auto-create unapproved request and deny
                     let _ = db.create_access_request(script.id, secret_entry.id);
                     let _ = db.log_event("secret_access_requested", Some(&body.script_id), Some(&name));
+
+                    // Notify the frontend so the user can approve inline
+                    if let Ok(handle_guard) = app.app_handle.lock() {
+                        if let Some(ref handle) = *handle_guard {
+                            let _ = handle.emit("secret-access-requested", AccessRequestEvent {
+                                script_id: body.script_id.clone(),
+                                script_name: script.script_name.clone(),
+                                secret_name: name.clone(),
+                            });
+                        }
+                    }
+
                     return Err(StatusCode::FORBIDDEN);
                 }
             }
@@ -295,6 +338,20 @@ pub async fn register_script_api(
                 .register_script(&body.script_id, &body.script_name, &body.domain)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             let _ = db.log_event("script_registered", Some(&body.script_id), None);
+
+            // Notify frontend about the new pending script
+            if !reg.approved {
+                if let Ok(handle_guard) = app.app_handle.lock() {
+                    if let Some(ref handle) = *handle_guard {
+                        let _ = handle.emit("script-pending-approval", ScriptPendingEvent {
+                            script_id: body.script_id.clone(),
+                            script_name: body.script_name.clone(),
+                            domain: body.domain.clone(),
+                        });
+                    }
+                }
+            }
+
             reg.approved
         }
     };

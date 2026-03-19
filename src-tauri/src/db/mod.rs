@@ -245,10 +245,26 @@ impl Database {
     }
 
     /// Delete a secret by name.
+    ///
+    /// Also removes any `script_secret_access` rows that reference the secret
+    /// so that the foreign-key constraint is satisfied.
     pub fn delete_secret(&self, name: &str) -> Result<(), DbError> {
+        // Look up the secret id first so we can clean up FK references.
+        let secret = self.get_secret_by_name(name)?;
+        let secret = match secret {
+            Some(s) => s,
+            None => return Err(DbError::NotFound(format!("Secret '{}' not found", name))),
+        };
+
+        // Remove script-secret access records that reference this secret.
+        self.conn.execute(
+            "DELETE FROM script_secret_access WHERE secret_id = ?1",
+            params![secret.id],
+        )?;
+
         let changed = self.conn.execute(
-            "DELETE FROM secrets WHERE name = ?1",
-            params![name],
+            "DELETE FROM secrets WHERE id = ?1",
+            params![secret.id],
         )?;
 
         if changed == 0 {

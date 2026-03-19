@@ -22,6 +22,7 @@ import VaultImport from '../components/vault/VaultImport';
 import ScriptListView from '../components/scripts/ScriptList';
 import ScriptDetail from '../components/scripts/ScriptDetail';
 import AuditLog from '../components/audit/AuditLog';
+import AccessRequestToast from '../components/ui/AccessRequestToast';
 import SettingsView from './Settings';
 
 type EditorState =
@@ -335,6 +336,9 @@ export default function Dashboard() {
           onRefresh={fetchScripts}
         />
       )}
+
+      {/* Access request toasts from HTTP API */}
+      <AccessRequestToast />
     </div>
   );
 }
