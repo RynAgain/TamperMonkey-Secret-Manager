@@ -1,8 +1,9 @@
 import { useEffect, useState, useCallback } from 'react';
-import { Lock, ShieldCheck, Key, Terminal, Archive, Download, Upload, ScrollText, FileCode, Settings } from 'lucide-react';
+import { Lock, ShieldCheck, Key, Terminal, Archive, Download, Upload, ScrollText, FileCode, Settings, Code } from 'lucide-react';
 import { useAuthStore } from '../stores/auth';
 import { useSecretsStore } from '../stores/secrets';
 import { useScriptsStore } from '../stores/scripts';
+import { useBlindCodeStore } from '../stores/blindCode';
 import {
   lockApp,
   listSecrets,
@@ -11,8 +12,10 @@ import {
   deleteSecret,
   getSecret,
   listScripts,
+  listBlindCodeModules,
   SecretMetadata,
   ScriptInfo,
+  BlindCodeModuleMetadata,
 } from '../lib/tauri';
 import SecretList from '../components/secrets/SecretList';
 import SecretEditor from '../components/secrets/SecretEditor';
@@ -21,6 +24,10 @@ import VaultExport from '../components/vault/VaultExport';
 import VaultImport from '../components/vault/VaultImport';
 import ScriptListView from '../components/scripts/ScriptList';
 import ScriptDetail from '../components/scripts/ScriptDetail';
+import BlindCodeListView from '../components/blindcode/BlindCodeList';
+import BlindCodeDetail from '../components/blindcode/BlindCodeDetail';
+import BlindCodeImport from '../components/blindcode/BlindCodeImport';
+import BlindCodeCreate from '../components/blindcode/BlindCodeCreate';
 import AuditLog from '../components/audit/AuditLog';
 import AccessRequestToast from '../components/ui/AccessRequestToast';
 import SettingsView from './Settings';
@@ -30,7 +37,7 @@ type EditorState =
   | { open: true; mode: 'create' }
   | { open: true; mode: 'edit'; secret: SecretMetadata; currentValue: string };
 
-type ActiveTab = 'secrets' | 'envvars' | 'vault' | 'scripts' | 'audit' | 'settings';
+type ActiveTab = 'secrets' | 'envvars' | 'vault' | 'scripts' | 'blindcode' | 'audit' | 'settings';
 
 export default function Dashboard() {
   const { setUnlocked } = useAuthStore();
@@ -44,10 +51,21 @@ export default function Dashboard() {
     selectedScript,
     setSelectedScript,
   } = useScriptsStore();
+  const {
+    modules: blindCodeModules,
+    isLoading: blindCodeLoading,
+    setModules: setBlindCodeModules,
+    setLoading: setBlindCodeLoading,
+    setError: setBlindCodeError,
+    selectedModule: selectedBlindCode,
+    setSelectedModule: setSelectedBlindCode,
+  } = useBlindCodeStore();
   const [editor, setEditor] = useState<EditorState>({ open: false });
   const [activeTab, setActiveTab] = useState<ActiveTab>('secrets');
   const [showVaultExport, setShowVaultExport] = useState(false);
   const [showVaultImport, setShowVaultImport] = useState(false);
+  const [showBlindCodeImport, setShowBlindCodeImport] = useState(false);
+  const [showBlindCodeCreate, setShowBlindCodeCreate] = useState(false);
 
   const fetchSecrets = useCallback(async () => {
     setLoading(true);
@@ -75,6 +93,19 @@ export default function Dashboard() {
     }
   }, [setScriptsState, setScriptsLoading, setScriptsError]);
 
+  const fetchBlindCodeModules = useCallback(async () => {
+    setBlindCodeLoading(true);
+    setBlindCodeError(null);
+    try {
+      const list = await listBlindCodeModules();
+      setBlindCodeModules(list);
+    } catch (err) {
+      setBlindCodeError(String(err));
+    } finally {
+      setBlindCodeLoading(false);
+    }
+  }, [setBlindCodeModules, setBlindCodeLoading, setBlindCodeError]);
+
   useEffect(() => {
     fetchSecrets();
   }, [fetchSecrets]);
@@ -83,7 +114,10 @@ export default function Dashboard() {
     if (activeTab === 'scripts') {
       fetchScripts();
     }
-  }, [activeTab, fetchScripts]);
+    if (activeTab === 'blindcode') {
+      fetchBlindCodeModules();
+    }
+  }, [activeTab, fetchScripts, fetchBlindCodeModules]);
 
   async function handleLock() {
     try {
@@ -148,11 +182,16 @@ export default function Dashboard() {
     setSelectedScript(script);
   }
 
+  function handleManageBlindCode(module: BlindCodeModuleMetadata) {
+    setSelectedBlindCode(module);
+  }
+
   const tabs: { id: ActiveTab; label: string; icon: React.ReactNode }[] = [
     { id: 'secrets', label: 'Secrets', icon: <Key className="w-4 h-4" /> },
     { id: 'envvars', label: 'Env Vars', icon: <Terminal className="w-4 h-4" /> },
     { id: 'vault', label: 'Vault', icon: <Archive className="w-4 h-4" /> },
     { id: 'scripts', label: 'Scripts', icon: <FileCode className="w-4 h-4" /> },
+    { id: 'blindcode', label: 'Blind Code', icon: <Code className="w-4 h-4" /> },
     { id: 'audit', label: 'Activity Log', icon: <ScrollText className="w-4 h-4" /> },
     { id: 'settings', label: 'Settings', icon: <Settings className="w-4 h-4" /> },
   ];
@@ -296,6 +335,18 @@ export default function Dashboard() {
           />
         )}
 
+        {/* Blind Code tab */}
+        {activeTab === 'blindcode' && (
+          <BlindCodeListView
+            modules={blindCodeModules}
+            isLoading={blindCodeLoading}
+            onRefresh={fetchBlindCodeModules}
+            onManageModule={handleManageBlindCode}
+            onImport={() => setShowBlindCodeImport(true)}
+            onCreate={() => setShowBlindCodeCreate(true)}
+          />
+        )}
+
         {/* Audit Log tab */}
         {activeTab === 'audit' && <AuditLog />}
 
@@ -334,6 +385,31 @@ export default function Dashboard() {
           script={selectedScript}
           onClose={() => setSelectedScript(null)}
           onRefresh={fetchScripts}
+        />
+      )}
+
+      {/* Blind code detail modal */}
+      {selectedBlindCode && (
+        <BlindCodeDetail
+          module={selectedBlindCode}
+          onClose={() => setSelectedBlindCode(null)}
+          onRefresh={fetchBlindCodeModules}
+        />
+      )}
+
+      {/* Blind code import modal */}
+      {showBlindCodeImport && (
+        <BlindCodeImport
+          onClose={() => setShowBlindCodeImport(false)}
+          onImported={fetchBlindCodeModules}
+        />
+      )}
+
+      {/* Blind code create modal */}
+      {showBlindCodeCreate && (
+        <BlindCodeCreate
+          onClose={() => setShowBlindCodeCreate(false)}
+          onCreated={fetchBlindCodeModules}
         />
       )}
 

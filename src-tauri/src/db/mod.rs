@@ -655,6 +655,277 @@ impl Database {
         }
         Ok(())
     }
+
+    // ------------------------------------------------------------------
+    // Blind Code Modules
+    // ------------------------------------------------------------------
+
+    /// Create a new blind code module. Returns the inserted row.
+    pub fn create_blind_code_module(
+        &self,
+        name: &str,
+        description: &str,
+        encrypted_code: &[u8],
+        language: &str,
+        required_secrets: &str,
+        allowed_params: &str,
+        blind: bool,
+        expires_at: Option<&str>,
+    ) -> Result<BlindCodeModule, DbError> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let result = self.conn.execute(
+            "INSERT INTO blind_code_modules (name, description, encrypted_code, language, required_secrets, allowed_params, approved, blind, created_at, updated_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10)",
+            params![
+                name,
+                description,
+                encrypted_code,
+                language,
+                required_secrets,
+                allowed_params,
+                blind as i32,
+                now,
+                now,
+                expires_at,
+            ],
+        );
+
+        match result {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err(DbError::AlreadyExists(format!(
+                    "Blind code module '{}' already exists",
+                    name
+                )));
+            }
+            Err(e) => return Err(DbError::SqliteError(e)),
+        }
+
+        let id = self.conn.last_insert_rowid();
+        Ok(BlindCodeModule {
+            id,
+            name: name.to_string(),
+            description: description.to_string(),
+            encrypted_code: encrypted_code.to_vec(),
+            language: language.to_string(),
+            required_secrets: required_secrets.to_string(),
+            allowed_params: allowed_params.to_string(),
+            approved: false,
+            blind,
+            created_at: now.clone(),
+            updated_at: now,
+            expires_at: expires_at.map(|s| s.to_string()),
+        })
+    }
+
+    /// Retrieve a blind code module by name.
+    pub fn get_blind_code_module(&self, name: &str) -> Result<Option<BlindCodeModule>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, encrypted_code, language, required_secrets, allowed_params, approved, blind, created_at, updated_at, expires_at
+             FROM blind_code_modules WHERE name = ?1",
+        )?;
+
+        let mut rows = stmt.query_map(params![name], |row| {
+            let approved_int: i32 = row.get(7)?;
+            let blind_int: i32 = row.get(8)?;
+            Ok(BlindCodeModule {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                encrypted_code: row.get(3)?,
+                language: row.get(4)?,
+                required_secrets: row.get(5)?,
+                allowed_params: row.get(6)?,
+                approved: approved_int != 0,
+                blind: blind_int != 0,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+                expires_at: row.get(11)?,
+            })
+        })?;
+
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all blind code modules.
+    pub fn list_blind_code_modules(&self) -> Result<Vec<BlindCodeModule>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, encrypted_code, language, required_secrets, allowed_params, approved, blind, created_at, updated_at, expires_at
+             FROM blind_code_modules ORDER BY name",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let approved_int: i32 = row.get(7)?;
+            let blind_int: i32 = row.get(8)?;
+            Ok(BlindCodeModule {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                encrypted_code: row.get(3)?,
+                language: row.get(4)?,
+                required_secrets: row.get(5)?,
+                allowed_params: row.get(6)?,
+                approved: approved_int != 0,
+                blind: blind_int != 0,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+                expires_at: row.get(11)?,
+            })
+        })?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+        Ok(entries)
+    }
+
+    /// Approve a blind code module for execution.
+    pub fn approve_blind_code_module(&self, name: &str) -> Result<(), DbError> {
+        let changed = self.conn.execute(
+            "UPDATE blind_code_modules SET approved = 1, updated_at = ?1 WHERE name = ?2",
+            params![chrono::Utc::now().to_rfc3339(), name],
+        )?;
+
+        if changed == 0 {
+            return Err(DbError::NotFound(format!(
+                "Blind code module '{}' not found",
+                name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Revoke approval for a blind code module.
+    pub fn revoke_blind_code_module(&self, name: &str) -> Result<(), DbError> {
+        let changed = self.conn.execute(
+            "UPDATE blind_code_modules SET approved = 0, updated_at = ?1 WHERE name = ?2",
+            params![chrono::Utc::now().to_rfc3339(), name],
+        )?;
+
+        if changed == 0 {
+            return Err(DbError::NotFound(format!(
+                "Blind code module '{}' not found",
+                name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Delete a blind code module and all its access records.
+    pub fn delete_blind_code_module(&self, name: &str) -> Result<(), DbError> {
+        let module = self.get_blind_code_module(name)?;
+        if let Some(m) = module {
+            self.conn.execute(
+                "DELETE FROM script_code_access WHERE code_module_id = ?1",
+                params![m.id],
+            )?;
+        }
+        let changed = self.conn.execute(
+            "DELETE FROM blind_code_modules WHERE name = ?1",
+            params![name],
+        )?;
+
+        if changed == 0 {
+            return Err(DbError::NotFound(format!(
+                "Blind code module '{}' not found",
+                name
+            )));
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Script-Code Access
+    // ------------------------------------------------------------------
+
+    /// Check if a script has approved access to a specific code module.
+    /// Returns None if no access record exists, Some(bool) for the approval status.
+    pub fn check_script_code_access(
+        &self,
+        script_reg_id: i64,
+        code_module_id: i64,
+    ) -> Result<Option<bool>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT approved FROM script_code_access
+             WHERE script_reg_id = ?1 AND code_module_id = ?2",
+        )?;
+
+        let mut rows = stmt.query_map(params![script_reg_id, code_module_id], |row| {
+            let approved_int: i32 = row.get(0)?;
+            Ok(approved_int != 0)
+        })?;
+
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Create an unapproved access request for a script+code module pair.
+    /// Does nothing if the record already exists.
+    pub fn create_code_access_request(
+        &self,
+        script_reg_id: i64,
+        code_module_id: i64,
+    ) -> Result<(), DbError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO script_code_access (script_reg_id, code_module_id, approved, created_at)
+             VALUES (?1, ?2, 0, ?3)",
+            params![script_reg_id, code_module_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Create or update a script-code access record.
+    pub fn set_script_code_access(
+        &self,
+        script_reg_id: i64,
+        code_module_id: i64,
+        approved: bool,
+    ) -> Result<(), DbError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO script_code_access (script_reg_id, code_module_id, approved, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(script_reg_id, code_module_id) DO UPDATE SET approved = ?3",
+            params![script_reg_id, code_module_id, approved as i32, now],
+        )?;
+        Ok(())
+    }
+
+    /// List all code module access records for a given script registration.
+    pub fn list_script_code_access(&self, script_reg_id: i64) -> Result<Vec<ScriptCodeAccessDetail>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT bcm.name, sca.approved, sca.created_at
+             FROM script_code_access sca
+             JOIN blind_code_modules bcm ON bcm.id = sca.code_module_id
+             WHERE sca.script_reg_id = ?1
+             ORDER BY bcm.name",
+        )?;
+
+        let rows = stmt.query_map(params![script_reg_id], |row| {
+            let approved_int: i32 = row.get(1)?;
+            Ok(ScriptCodeAccessDetail {
+                module_name: row.get(0)?,
+                approved: approved_int != 0,
+                created_at: row.get(2)?,
+            })
+        })?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+        Ok(entries)
+    }
 }
 
 // ======================================================================
@@ -708,10 +979,12 @@ mod tests {
 
         let expected = [
             "audit_log",
+            "blind_code_modules",
             "config",
             "env_var_config",
             "master_config",
             "schema_version",
+            "script_code_access",
             "script_registrations",
             "script_secret_access",
             "secrets",

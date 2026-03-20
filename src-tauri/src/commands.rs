@@ -1372,3 +1372,493 @@ pub async fn rotate_api_token(
 
     Ok(new_token)
 }
+
+// ======================================================================
+// Blind Code Module Types
+// ======================================================================
+
+/// Metadata for a blind code module (never includes the actual code).
+#[derive(Debug, Clone, Serialize)]
+pub struct BlindCodeModuleMetadata {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub language: String,
+    pub required_secrets: Vec<String>,
+    pub allowed_params: Vec<String>,
+    pub approved: bool,
+    pub blind: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub expires_at: Option<String>,
+}
+
+/// Result info for a blind code module import.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportedCodeModuleInfo {
+    pub name: String,
+    pub description: String,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+/// Info about a script's access to a code module.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScriptCodeAccessInfo {
+    pub module_name: String,
+    pub approved: bool,
+    pub created_at: String,
+}
+
+// ======================================================================
+// Blind Code Module Commands
+// ======================================================================
+
+/// List all blind code modules (metadata only -- code is never sent to frontend).
+#[tauri::command]
+pub async fn list_blind_code_modules(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<BlindCodeModuleMetadata>, String> {
+    enforce_unlocked_or_auto_lock(&state)?;
+
+    let db_guard = state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(|| "Database not initialised".to_string())?;
+
+    let modules = db.list_blind_code_modules().map_err(|e| format!("DB error: {e}"))?;
+
+    let result: Vec<BlindCodeModuleMetadata> = modules
+        .into_iter()
+        .map(|m| {
+            let required_secrets: Vec<String> =
+                serde_json::from_str(&m.required_secrets).unwrap_or_default();
+            let allowed_params: Vec<String> =
+                serde_json::from_str(&m.allowed_params).unwrap_or_default();
+            BlindCodeModuleMetadata {
+                id: m.id,
+                name: m.name,
+                description: m.description,
+                language: m.language,
+                required_secrets,
+                allowed_params,
+                approved: m.approved,
+                blind: m.blind,
+                created_at: m.created_at,
+                updated_at: m.updated_at,
+                expires_at: m.expires_at,
+            }
+        })
+        .collect();
+
+    Ok(result)
+}
+
+/// Import a blind code module from a .tmcode file.
+#[tauri::command]
+pub async fn import_blind_code_file(
+    file_path: String,
+    pin: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<ImportedCodeModuleInfo, String> {
+    enforce_unlocked_or_auto_lock(&state)?;
+    validate_pin(&pin)?;
+
+    // Get master key
+    let master_key = {
+        let key_guard = state
+            .master_key
+            .lock()
+            .map_err(|e| format!("Lock error: {e}"))?;
+        key_guard
+            .ok_or_else(|| "App is locked -- unlock first".to_string())?
+    };
+
+    // Read .tmcode file
+    let file_data = std::fs::read(&file_path)
+        .map_err(|e| format!("Failed to read code file: {e}"))?;
+
+    // Decrypt
+    let mut payload = crate::secrets::blind_code::import_code(&file_data, &pin)
+        .map_err(|e| format!("Code import failed: {e}"))?;
+
+    // Security: zeroize PIN
+    let mut pin_buf = pin;
+    pin_buf.zeroize();
+
+    if payload.modules.is_empty() {
+        return Err("Code file contains no modules".to_string());
+    }
+
+    let module = &mut payload.modules[0];
+    let module_name = module.name.clone();
+    let module_desc = module.description.clone();
+
+    // Encrypt the Rhai code with the master key for DB storage
+    let encrypted = encryption::encrypt(module.code.as_bytes(), &master_key)
+        .map_err(|e| format!("Encryption failed: {e}"))?;
+    let encrypted_bytes = encrypted.to_bytes();
+
+    // Security: zeroize the plaintext code
+    module.code.zeroize();
+
+    // Serialize required_secrets and allowed_params as JSON
+    let required_secrets_json = serde_json::to_string(&module.required_secrets)
+        .map_err(|e| format!("JSON error: {e}"))?;
+    let allowed_params_json = serde_json::to_string(&module.allowed_params)
+        .map_err(|e| format!("JSON error: {e}"))?;
+
+    // Store in DB
+    let db_guard = state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(|| "Database not initialised".to_string())?;
+
+    let module_language = module.language.clone();
+
+    match db.create_blind_code_module(
+        &module_name,
+        &module_desc,
+        &encrypted_bytes,
+        &module_language,
+        &required_secrets_json,
+        &allowed_params_json,
+        true, // always blind for imported modules
+        payload.expires_at.as_deref(),
+    ) {
+        Ok(_) => {
+            let _ = db.log_event("blind_code_imported", None, Some(&module_name));
+            Ok(ImportedCodeModuleInfo {
+                name: module_name,
+                description: module_desc,
+                success: true,
+                error: None,
+            })
+        }
+        Err(e) => Ok(ImportedCodeModuleInfo {
+            name: module_name,
+            description: module_desc,
+            success: false,
+            error: Some(format!("{e}")),
+        }),
+    }
+}
+
+/// Export a blind code module as a .tmcode file (for code authors).
+///
+/// If the module is blind, the code is decrypted from storage for export.
+/// The exported file is encrypted with the provided PIN.
+#[tauri::command]
+pub async fn export_blind_code_file(
+    module_name: String,
+    pin: String,
+    file_path: String,
+    expires_at: Option<String>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    enforce_unlocked_or_auto_lock(&state)?;
+    validate_pin(&pin)?;
+
+    // Get master key
+    let master_key = {
+        let key_guard = state
+            .master_key
+            .lock()
+            .map_err(|e| format!("Lock error: {e}"))?;
+        key_guard
+            .ok_or_else(|| "App is locked -- unlock first".to_string())?
+    };
+
+    // Look up the module
+    let module = {
+        let db_guard = state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
+        let db = db_guard
+            .as_ref()
+            .ok_or_else(|| "Database not initialised".to_string())?;
+        db.get_blind_code_module(&module_name)
+            .map_err(|e| format!("DB error: {e}"))?
+            .ok_or_else(|| format!("Module '{}' not found", module_name))?
+    };
+
+    // Decrypt the code
+    let encrypted_data = encryption::EncryptedData::from_bytes(&module.encrypted_code)
+        .map_err(|e| format!("Invalid encrypted data: {e}"))?;
+    let mut code_bytes = encryption::decrypt(&encrypted_data, &master_key)
+        .map_err(|e| format!("Decryption failed: {e}"))?;
+    let mut code = String::from_utf8(code_bytes.clone())
+        .map_err(|e| format!("Invalid UTF-8 in code: {e}"))?;
+    code_bytes.zeroize();
+
+    let required_secrets: Vec<String> =
+        serde_json::from_str(&module.required_secrets).unwrap_or_default();
+    let allowed_params: Vec<String> =
+        serde_json::from_str(&module.allowed_params).unwrap_or_default();
+
+    // Build the code module entry
+    let entry = crate::secrets::blind_code::CodeModuleEntry {
+        name: module.name.clone(),
+        description: module.description.clone(),
+        language: module.language.clone(),
+        code: code.clone(),
+        required_secrets,
+        allowed_params,
+    };
+
+    // Security: zeroize code
+    code.zeroize();
+
+    // Export to .tmcode format
+    let file_bytes = crate::secrets::blind_code::export_code(entry, &pin, expires_at)
+        .map_err(|e| format!("Export failed: {e}"))?;
+
+    // Security: zeroize PIN
+    let mut pin_buf = pin;
+    pin_buf.zeroize();
+
+    // Write to file
+    std::fs::write(&file_path, &file_bytes)
+        .map_err(|e| format!("Failed to write code file: {e}"))?;
+
+    // Log audit event
+    {
+        let db_guard = state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
+        if let Some(db) = db_guard.as_ref() {
+            let _ = db.log_event("blind_code_exported", None, Some(&module_name));
+        }
+    }
+
+    Ok(())
+}
+
+/// Create a new blind code module directly (for code authors).
+/// The code is encrypted with the master key before storage.
+#[tauri::command]
+pub async fn create_blind_code_module(
+    name: String,
+    description: String,
+    language: String,
+    code: String,
+    required_secrets: Vec<String>,
+    allowed_params: Vec<String>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    enforce_unlocked_or_auto_lock(&state)?;
+    validate_secret_name(&name)?;
+
+    // Get master key
+    let master_key = {
+        let key_guard = state
+            .master_key
+            .lock()
+            .map_err(|e| format!("Lock error: {e}"))?;
+        key_guard
+            .ok_or_else(|| "App is locked -- unlock first".to_string())?
+    };
+
+    // Encrypt the code
+    let encrypted = encryption::encrypt(code.as_bytes(), &master_key)
+        .map_err(|e| format!("Encryption failed: {e}"))?;
+    let encrypted_bytes = encrypted.to_bytes();
+
+    // Security: zeroize plaintext code
+    let mut code_buf = code;
+    code_buf.zeroize();
+
+    // Serialize required_secrets and allowed_params
+    let required_secrets_json = serde_json::to_string(&required_secrets)
+        .map_err(|e| format!("JSON error: {e}"))?;
+    let allowed_params_json = serde_json::to_string(&allowed_params)
+        .map_err(|e| format!("JSON error: {e}"))?;
+
+    // Store in DB
+    let db_guard = state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(|| "Database not initialised".to_string())?;
+
+    db.create_blind_code_module(
+        &name,
+        &description,
+        &encrypted_bytes,
+        &language,
+        &required_secrets_json,
+        &allowed_params_json,
+        false, // not blind when author creates locally -- they can see their own code
+        None,
+    )
+    .map_err(|e| format!("Failed to create module: {e}"))?;
+
+    db.log_event("blind_code_created", None, Some(&name))
+        .map_err(|e| format!("Failed to log event: {e}"))?;
+
+    Ok(())
+}
+
+/// Approve a blind code module for execution.
+#[tauri::command]
+pub async fn approve_blind_code_module(
+    name: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let db_guard = state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(|| "Database not initialised".to_string())?;
+
+    db.approve_blind_code_module(&name)
+        .map_err(|e| format!("Failed to approve module: {e}"))?;
+
+    db.log_event("blind_code_approved", None, Some(&name))
+        .map_err(|e| format!("Failed to log event: {e}"))?;
+
+    Ok(())
+}
+
+/// Revoke approval for a blind code module.
+#[tauri::command]
+pub async fn revoke_blind_code_module(
+    name: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let db_guard = state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(|| "Database not initialised".to_string())?;
+
+    db.revoke_blind_code_module(&name)
+        .map_err(|e| format!("Failed to revoke module: {e}"))?;
+
+    db.log_event("blind_code_revoked", None, Some(&name))
+        .map_err(|e| format!("Failed to log event: {e}"))?;
+
+    Ok(())
+}
+
+/// Delete a blind code module and all its access records.
+#[tauri::command]
+pub async fn delete_blind_code_module(
+    name: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let db_guard = state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(|| "Database not initialised".to_string())?;
+
+    db.delete_blind_code_module(&name)
+        .map_err(|e| format!("Failed to delete module: {e}"))?;
+
+    db.log_event("blind_code_deleted", None, Some(&name))
+        .map_err(|e| format!("Failed to log event: {e}"))?;
+
+    Ok(())
+}
+
+/// List all code module access records for a given script.
+#[tauri::command]
+pub async fn list_script_code_access(
+    script_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<ScriptCodeAccessInfo>, String> {
+    let db_guard = state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(|| "Database not initialised".to_string())?;
+
+    let script = db
+        .get_script(&script_id)
+        .map_err(|e| format!("DB error: {e}"))?
+        .ok_or_else(|| format!("Script '{}' not found", script_id))?;
+
+    let access = db
+        .list_script_code_access(script.id)
+        .map_err(|e| format!("DB error: {e}"))?;
+
+    let result: Vec<ScriptCodeAccessInfo> = access
+        .into_iter()
+        .map(|a| ScriptCodeAccessInfo {
+            module_name: a.module_name,
+            approved: a.approved,
+            created_at: a.created_at,
+        })
+        .collect();
+
+    Ok(result)
+}
+
+/// Set access for a script to a specific code module.
+#[tauri::command]
+pub async fn set_script_code_module_access(
+    script_id: String,
+    module_name: String,
+    approved: bool,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let db_guard = state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(|| "Database not initialised".to_string())?;
+
+    let script = db
+        .get_script(&script_id)
+        .map_err(|e| format!("DB error: {e}"))?
+        .ok_or_else(|| format!("Script '{}' not found", script_id))?;
+
+    let module = db
+        .get_blind_code_module(&module_name)
+        .map_err(|e| format!("DB error: {e}"))?
+        .ok_or_else(|| format!("Module '{}' not found", module_name))?;
+
+    db.set_script_code_access(script.id, module.id, approved)
+        .map_err(|e| format!("Failed to set access: {e}"))?;
+
+    db.log_event("script_code_access_updated", Some(&script_id), Some(&module_name))
+        .map_err(|e| format!("Failed to log event: {e}"))?;
+
+    Ok(())
+}
+
+/// Get the Rhai code for a non-blind module (code author viewing their own code).
+/// Returns None if the module is blind (imported, cannot be viewed).
+#[tauri::command]
+pub async fn get_blind_code_module_code(
+    name: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Option<String>, String> {
+    enforce_unlocked_or_auto_lock(&state)?;
+
+    let master_key = {
+        let key_guard = state
+            .master_key
+            .lock()
+            .map_err(|e| format!("Lock error: {e}"))?;
+        key_guard
+            .ok_or_else(|| "App is locked -- unlock first".to_string())?
+    };
+
+    let db_guard = state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(|| "Database not initialised".to_string())?;
+
+    let module = db
+        .get_blind_code_module(&name)
+        .map_err(|e| format!("DB error: {e}"))?
+        .ok_or_else(|| format!("Module '{}' not found", name))?;
+
+    if module.blind {
+        // Blind modules never expose code to frontend
+        return Ok(None);
+    }
+
+    // Non-blind: decrypt and return
+    let encrypted_data = encryption::EncryptedData::from_bytes(&module.encrypted_code)
+        .map_err(|e| format!("Invalid encrypted data: {e}"))?;
+    let mut decrypted = encryption::decrypt(&encrypted_data, &master_key)
+        .map_err(|e| format!("Decryption failed: {e}"))?;
+    let code = String::from_utf8(decrypted.clone())
+        .map_err(|e| format!("Invalid UTF-8: {e}"))?;
+    decrypted.zeroize();
+
+    Ok(Some(code))
+}

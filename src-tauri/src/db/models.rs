@@ -133,3 +133,58 @@ pub struct EnvVarConfig {
     /// ISO 8601 timestamp of creation.
     pub created_at: String,
 }
+
+/// A blind code module -- encrypted script that executes server-side.
+/// Code is never sent to the frontend; only metadata is visible.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlindCodeModule {
+    pub id: i64,
+    /// Unique human-readable name (e.g., "github-api-caller").
+    pub name: String,
+    /// Description of what the module does.
+    pub description: String,
+    /// AES-256-GCM encrypted source code.
+    pub encrypted_code: Vec<u8>,
+    /// The scripting language: "rhai", "python", "javascript", or "typescript".
+    pub language: String,
+    /// JSON array of secret names this module needs (e.g., `["GITHUB_TOKEN"]`).
+    pub required_secrets: String,
+    /// JSON array of parameter names accepted from TM scripts (e.g., `["url", "method"]`).
+    pub allowed_params: String,
+    /// Whether the module has been approved for execution.
+    pub approved: bool,
+    /// If true, code cannot be sent to the frontend (always true for imported modules).
+    pub blind: bool,
+    /// ISO 8601 timestamp of creation.
+    pub created_at: String,
+    /// ISO 8601 timestamp of last update.
+    pub updated_at: String,
+    /// Optional ISO 8601 UTC expiration timestamp.
+    pub expires_at: Option<String>,
+}
+
+/// Maps which scripts have access to which blind code modules.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScriptCodeAccess {
+    pub id: i64,
+    /// FK to `ScriptRegistration`.
+    pub script_reg_id: i64,
+    /// FK to `BlindCodeModule`.
+    pub code_module_id: i64,
+    /// Whether the access has been approved by the user.
+    pub approved: bool,
+    /// ISO 8601 timestamp of creation.
+    pub created_at: String,
+}
+
+/// Joined detail for a script's access to a specific code module.
+/// Returned by `Database::list_script_code_access()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScriptCodeAccessDetail {
+    /// Name of the code module.
+    pub module_name: String,
+    /// Whether the access has been approved by the user.
+    pub approved: bool,
+    /// ISO 8601 timestamp of creation.
+    pub created_at: String,
+}

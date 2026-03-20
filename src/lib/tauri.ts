@@ -215,3 +215,108 @@ export async function importVault(
     pin,
   });
 }
+
+// ------------------------------------------------------------------
+// Blind Code Module types & wrappers
+// ------------------------------------------------------------------
+
+export interface BlindCodeModuleMetadata {
+  id: number;
+  name: string;
+  description: string;
+  language: string;
+  required_secrets: string[];
+  allowed_params: string[];
+  approved: boolean;
+  blind: boolean;
+  created_at: string;
+  updated_at: string;
+  expires_at: string | null;
+}
+
+export interface ImportedCodeModuleInfo {
+  name: string;
+  description: string;
+  success: boolean;
+  error: string | null;
+}
+
+export interface ScriptCodeAccessInfo {
+  module_name: string;
+  approved: boolean;
+  created_at: string;
+}
+
+export async function listBlindCodeModules(): Promise<BlindCodeModuleMetadata[]> {
+  return invoke<BlindCodeModuleMetadata[]>('list_blind_code_modules');
+}
+
+export async function importBlindCodeFile(
+  filePath: string,
+  pin: string,
+): Promise<ImportedCodeModuleInfo> {
+  return invoke<ImportedCodeModuleInfo>('import_blind_code_file', {
+    filePath,
+    pin,
+  });
+}
+
+export async function exportBlindCodeFile(
+  moduleName: string,
+  pin: string,
+  filePath: string,
+  expiresAt?: string | null,
+): Promise<void> {
+  return invoke<void>('export_blind_code_file', {
+    moduleName,
+    pin,
+    filePath,
+    expiresAt: expiresAt ?? null,
+  });
+}
+
+export async function createBlindCodeModule(
+  name: string,
+  description: string,
+  language: string,
+  code: string,
+  requiredSecrets: string[],
+  allowedParams: string[],
+): Promise<void> {
+  return invoke<void>('create_blind_code_module', {
+    name,
+    description,
+    language,
+    code,
+    requiredSecrets,
+    allowedParams,
+  });
+}
+
+export async function approveBlindCodeModule(name: string): Promise<void> {
+  return invoke<void>('approve_blind_code_module', { name });
+}
+
+export async function revokeBlindCodeModule(name: string): Promise<void> {
+  return invoke<void>('revoke_blind_code_module', { name });
+}
+
+export async function deleteBlindCodeModule(name: string): Promise<void> {
+  return invoke<void>('delete_blind_code_module', { name });
+}
+
+export async function listScriptCodeAccess(scriptId: string): Promise<ScriptCodeAccessInfo[]> {
+  return invoke<ScriptCodeAccessInfo[]>('list_script_code_access', { scriptId });
+}
+
+export async function setScriptCodeModuleAccess(
+  scriptId: string,
+  moduleName: string,
+  approved: boolean,
+): Promise<void> {
+  return invoke<void>('set_script_code_module_access', { scriptId, moduleName, approved });
+}
+
+export async function getBlindCodeModuleCode(name: string): Promise<string | null> {
+  return invoke<string | null>('get_blind_code_module_code', { name });
+}

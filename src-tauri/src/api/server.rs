@@ -96,6 +96,7 @@ pub async fn start_api_server(
         .route("/api/health", get(routes::health))
         .route("/api/secrets/{name}", post(routes::get_secret_api))
         .route("/api/register", post(routes::register_script_api))
+        .route("/api/execute/{module_name}", post(routes::execute_code_api))
         .layer(CorsLayer::permissive())
         .with_state(api_state)
         .route_layer(middleware::from_fn_with_state(

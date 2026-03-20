@@ -361,3 +361,200 @@ pub async fn register_script_api(
         script_id: body.script_id,
     }))
 }
+
+/// Payload emitted to the frontend when a script requests to execute a code
+/// module it has not yet been approved for.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeExecutionRequestEvent {
+    pub script_id: String,
+    pub script_name: String,
+    pub module_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExecuteCodeRequest {
+    pub script_id: String,
+    pub domain: String,
+    pub params: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExecuteCodeResponse {
+    pub result: String,
+}
+
+/// `POST /api/execute/:module_name` -- bearer auth required.
+///
+/// Executes a blind code module in a sandboxed Rhai engine.
+/// The TM script provides parameters; secrets are resolved server-side.
+/// Only the execution result is returned -- secrets never leave TMSM.
+pub async fn execute_code_api(
+    Path(module_name): Path<String>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<ExecuteCodeRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    // -- Auth: read the current shared token --
+    {
+        let token_guard = state
+            .bearer_token
+            .read()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        verify_bearer(&headers, &token_guard)?;
+    }
+
+    // -- Validate module name --
+    validate_secret_name(&module_name).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let app = &state.app_state;
+
+    // -- Check unlocked --
+    {
+        let unlocked = app.is_unlocked.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if !*unlocked {
+            return Err(StatusCode::LOCKED); // 423
+        }
+    }
+
+    // -- Look up the module and check script access --
+    let module = {
+        let db_guard = app.db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let db = db_guard.as_ref().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        // Check script registration + approval
+        let script = match db.get_script(&body.script_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
+            Some(script) => {
+                if !script.approved {
+                    return Err(StatusCode::FORBIDDEN);
+                }
+                script
+            }
+            None => {
+                // Auto-register as unapproved
+                let _ = db.register_script(&body.script_id, &body.script_id, &body.domain);
+                let _ = db.log_event("script_auto_registered", Some(&body.script_id), Some(&module_name));
+
+                if let Ok(handle_guard) = app.app_handle.lock() {
+                    if let Some(ref handle) = *handle_guard {
+                        let _ = handle.emit("script-pending-approval", ScriptPendingEvent {
+                            script_id: body.script_id.clone(),
+                            script_name: body.script_id.clone(),
+                            domain: body.domain.clone(),
+                        });
+                    }
+                }
+
+                return Err(StatusCode::FORBIDDEN);
+            }
+        };
+
+        // Look up the code module
+        let module = db
+            .get_blind_code_module(&module_name)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+
+        // Check module is approved
+        if !module.approved {
+            return Err(StatusCode::FORBIDDEN);
+        }
+
+        // Check expiration
+        if let Some(ref exp) = module.expires_at {
+            if let Ok(expiry) = chrono::DateTime::parse_from_rfc3339(exp) {
+                if chrono::Utc::now() > expiry {
+                    let _ = db.log_event("code_module_expired", Some(&body.script_id), Some(&module_name));
+                    return Err(StatusCode::GONE);
+                }
+            }
+        }
+
+        // Check per-script access to this module
+        match db.check_script_code_access(script.id, module.id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        {
+            Some(true) => { /* Access approved */ }
+            Some(false) => {
+                return Err(StatusCode::FORBIDDEN);
+            }
+            None => {
+                // No record -- create unapproved request
+                let _ = db.create_code_access_request(script.id, module.id);
+                let _ = db.log_event("code_execution_requested", Some(&body.script_id), Some(&module_name));
+
+                if let Ok(handle_guard) = app.app_handle.lock() {
+                    if let Some(ref handle) = *handle_guard {
+                        let _ = handle.emit("code-execution-requested", CodeExecutionRequestEvent {
+                            script_id: body.script_id.clone(),
+                            script_name: script.script_name.clone(),
+                            module_name: module_name.clone(),
+                        });
+                    }
+                }
+
+                return Err(StatusCode::FORBIDDEN);
+            }
+        }
+
+        module
+    };
+
+    // -- Get master key --
+    let master_key = {
+        let key_guard = app.master_key.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        key_guard.ok_or(StatusCode::LOCKED)?
+    };
+
+    // -- Decrypt the module code --
+    let code = {
+        let encrypted_data = crate::crypto::encryption::EncryptedData::from_bytes(&module.encrypted_code)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let decrypted = crate::crypto::encryption::decrypt(&encrypted_data, &master_key)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        String::from_utf8(decrypted).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+
+    // -- Parse required_secrets and allowed_params from JSON --
+    let required_secrets: Vec<String> = serde_json::from_str(&module.required_secrets)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let allowed_params: Vec<String> = serde_json::from_str(&module.allowed_params)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // -- Resolve secrets --
+    let secrets = {
+        let db_guard = app.db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let db = db_guard.as_ref().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        crate::secrets::executor::resolve_secrets(db, &master_key, &required_secrets)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+
+    // -- Execute in sandbox --
+    let params = body.params.unwrap_or_default();
+    let mut ctx = crate::secrets::executor::ExecutionContext {
+        code,
+        required_secrets,
+        allowed_params,
+        params,
+        secrets,
+    };
+
+    let result = crate::secrets::executor::dispatch_execute(&module.language, &mut ctx)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // -- Audit log --
+    {
+        let db_guard = app.db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if let Some(db) = db_guard.as_ref() {
+            let _ = db.log_event("code_module_executed", Some(&body.script_id), Some(&module_name));
+        }
+    }
+
+    // -- Response with security headers --
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert("cache-control", "no-store, no-cache, must-revalidate".parse().unwrap());
+    response_headers.insert("pragma", "no-cache".parse().unwrap());
+    response_headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+
+    Ok((StatusCode::OK, response_headers, Json(ExecuteCodeResponse { result: result.output })))
+}

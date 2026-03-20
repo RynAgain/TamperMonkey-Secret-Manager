@@ -91,6 +91,16 @@ pub fn run() {
             commands::list_script_access,
             commands::set_script_secret_access,
             commands::get_audit_log,
+            commands::list_blind_code_modules,
+            commands::import_blind_code_file,
+            commands::export_blind_code_file,
+            commands::create_blind_code_module,
+            commands::approve_blind_code_module,
+            commands::revoke_blind_code_module,
+            commands::delete_blind_code_module,
+            commands::list_script_code_access,
+            commands::set_script_code_module_access,
+            commands::get_blind_code_module_code,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

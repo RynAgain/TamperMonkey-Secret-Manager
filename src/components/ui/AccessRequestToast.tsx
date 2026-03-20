@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { ShieldAlert, FileCode, Check, X } from 'lucide-react';
-import { setScriptSecretAccess, approveScript } from '../../lib/tauri';
+import { ShieldAlert, FileCode, Code, Check, X } from 'lucide-react';
+import { setScriptSecretAccess, approveScript, setScriptCodeModuleAccess } from '../../lib/tauri';
 
 // -- Event payloads from the backend ----------------------------------
 
@@ -15,6 +15,12 @@ interface ScriptPendingPayload {
   script_id: string;
   script_name: string;
   domain: string;
+}
+
+interface CodeExecutionRequestPayload {
+  script_id: string;
+  script_name: string;
+  module_name: string;
 }
 
 // -- Unified notification model ---------------------------------------
@@ -35,6 +41,14 @@ type Notification =
       scriptName: string;
       domain: string;
       busy: boolean;
+    }
+  | {
+      kind: 'code-execution';
+      key: string;
+      scriptId: string;
+      scriptName: string;
+      moduleName: string;
+      busy: boolean;
     };
 
 /**
@@ -42,11 +56,13 @@ type Notification =
  * HTTP API.  Notifications **stay visible** until the user explicitly
  * approves or dismisses them. Duplicates (same key) are suppressed.
  *
- * Two event types are handled:
+ * Three event types are handled:
  * - `secret-access-requested` -- a script wants a secret it hasn't been
  *   approved for yet.
  * - `script-pending-approval` -- a new script registered and needs the
  *   user to approve it.
+ * - `code-execution-requested` -- a script wants to execute a blind code
+ *   module.
  */
 export default function AccessRequestToast() {
   const [items, setItems] = useState<Notification[]>([]);
@@ -100,6 +116,28 @@ export default function AccessRequestToast() {
       }),
     );
 
+    unlisteners.push(
+      listen<CodeExecutionRequestPayload>('code-execution-requested', (event) => {
+        const p = event.payload;
+        const key = `ce::${p.script_id}::${p.module_name}`;
+
+        setItems((prev) => {
+          if (prev.some((n) => n.key === key)) return prev;
+          return [
+            ...prev,
+            {
+              kind: 'code-execution',
+              key,
+              scriptId: p.script_id,
+              scriptName: p.script_name,
+              moduleName: p.module_name,
+              busy: false,
+            },
+          ];
+        });
+      }),
+    );
+
     return () => {
       unlisteners.forEach((p) => p.then((fn) => fn()));
     };
@@ -143,6 +181,19 @@ export default function AccessRequestToast() {
     [markBusy, dismiss],
   );
 
+  const handleApproveCodeExecution = useCallback(
+    async (n: Extract<Notification, { kind: 'code-execution' }>) => {
+      markBusy(n.key);
+      try {
+        await setScriptCodeModuleAccess(n.scriptId, n.moduleName, true);
+      } catch (err) {
+        console.error('Failed to approve code execution:', err);
+      }
+      setTimeout(() => dismiss(n.key), 400);
+    },
+    [markBusy, dismiss],
+  );
+
   // -- Render ---------------------------------------------------------
 
   if (items.length === 0) return null;
@@ -166,9 +217,14 @@ export default function AccessRequestToast() {
                   className="w-5 h-5 text-[var(--color-warning)] flex-shrink-0 mt-0.5"
                   strokeWidth={1.5}
                 />
-              ) : (
+              ) : n.kind === 'script-pending' ? (
                 <FileCode
                   className="w-5 h-5 text-[var(--color-info)] flex-shrink-0 mt-0.5"
+                  strokeWidth={1.5}
+                />
+              ) : (
+                <Code
+                  className="w-5 h-5 text-[var(--color-accent-gold)] flex-shrink-0 mt-0.5"
                   strokeWidth={1.5}
                 />
               )}
@@ -189,7 +245,7 @@ export default function AccessRequestToast() {
                       </span>
                     </p>
                   </>
-                ) : (
+                ) : n.kind === 'script-pending' ? (
                   <>
                     <p className="text-[var(--color-text-primary)] text-sm font-semibold leading-tight">
                       New Script Registration
@@ -205,6 +261,21 @@ export default function AccessRequestToast() {
                       wants approval
                     </p>
                   </>
+                ) : (
+                  <>
+                    <p className="text-[var(--color-text-primary)] text-sm font-semibold leading-tight">
+                      Code Execution Request
+                    </p>
+                    <p className="text-[var(--color-text-secondary)] text-xs mt-1">
+                      <span className="font-mono text-[var(--color-accent-gold)]">
+                        {n.scriptName}
+                      </span>{' '}
+                      wants to execute{' '}
+                      <span className="font-mono text-[var(--color-accent-gold)]">
+                        {n.moduleName}
+                      </span>
+                    </p>
+                  </>
                 )}
               </div>
             </div>
@@ -215,7 +286,9 @@ export default function AccessRequestToast() {
                 onClick={() =>
                   n.kind === 'secret-access'
                     ? handleApproveAccess(n)
-                    : handleApproveScript(n)
+                    : n.kind === 'script-pending'
+                      ? handleApproveScript(n)
+                      : handleApproveCodeExecution(n)
                 }
                 disabled={n.busy}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold

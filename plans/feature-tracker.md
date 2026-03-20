@@ -99,3 +99,40 @@
 - [x] Document all residual risks with severity ratings and accepted trade-offs
 - [x] Create incident response playbook: token compromise, vault file leak, dependency vulnerability
 - [x] Prepare documentation for potential third-party security review
+
+## Phase 8 -- Blind Code Modules
+
+- [x] Design .tmcode file format (header + encrypted Rhai code payload)
+- [x] DB migration v4: blind_code_modules and script_code_access tables
+- [x] Add BlindCodeModule and ScriptCodeAccess models
+- [x] Implement .tmcode export: create module, set PIN, generate .tmcode file
+- [x] Implement .tmcode import: load file, enter PIN, decrypt and store
+- [x] Add Rhai scripting engine dependency (rhai crate)
+- [x] Implement sandboxed Rhai execution engine with controlled API surface
+- [x] Implement secret() function injection for Rhai scripts (reads from encrypted store)
+- [x] Implement HTTP helper functions for Rhai scripts (http_get, http_post)
+- [x] Implement parameter validation (only allowed_params accepted from TM scripts)
+- [x] Add POST /api/execute/:module_name HTTP endpoint
+- [x] Per-script + per-module access control (approval required)
+- [x] Toast notifications for new module execution requests
+- [x] IPC commands: list, import, export, approve, revoke, delete blind code modules
+- [x] IPC commands: list and set script-to-module access
+- [x] IPC command: create_blind_code_module (for code authors)
+- [x] Frontend: BlindCodeList component (shows module metadata, never code)
+- [x] Frontend: BlindCodeDetail component (approval controls, access management)
+- [x] Frontend: BlindCodeImport component (file picker + PIN entry)
+- [x] Frontend: BlindCodeExport component (code editor + PIN + export)
+- [x] Frontend: Zustand store for blind code modules
+- [x] Audit logging for all module operations (import, execute, approve, revoke)
+- [x] Blind mode enforcement: code never sent to frontend via IPC
+- [x] Expiration support for blind code modules
+- [x] Integration tests: .tmcode roundtrip, execution, access control
+- [x] Security review: verify no code leakage path to frontend
+- [x] DB migration v5: language column for multi-language support
+- [x] Add language field to BlindCodeModule model and CodeModuleEntry format
+- [x] Implement Python subprocess executor (sandboxed, net-allowed, fs-restricted)
+- [x] Implement JavaScript/TypeScript Deno subprocess executor (--allow-net only)
+- [x] Implement execution dispatcher (routes by language: rhai/python/javascript/typescript)
+- [x] Frontend: language selector in create component, language display in list/detail
+- [x] Integration tests for .tmcode format, Rhai execution, DB operations (18 tests)
+- [x] Security review of blind code modules (all languages)

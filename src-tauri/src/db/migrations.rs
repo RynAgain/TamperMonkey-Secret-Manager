@@ -3,7 +3,7 @@ use rusqlite::Connection;
 
 /// Current schema version. Increment when adding new migrations.
 #[allow(dead_code)]
-const CURRENT_VERSION: i64 = 3;
+const CURRENT_VERSION: i64 = 5;
 
 /// Run all pending migrations on the given database connection.
 ///
@@ -39,8 +39,16 @@ pub fn run_migrations(conn: &Connection) -> Result<(), DbError> {
         migrate_v3(conn)?;
     }
 
+    if version < 4 {
+        migrate_v4(conn)?;
+    }
+
+    if version < 5 {
+        migrate_v5(conn)?;
+    }
+
     // Future migrations go here:
-    // if version < 4 { migrate_v4(conn)?; }
+    // if version < 6 { migrate_v6(conn)?; }
 
     Ok(())
 }
@@ -137,6 +145,57 @@ fn migrate_v3(conn: &Connection) -> Result<(), DbError> {
 
     conn.execute_batch(sql)
         .map_err(|e| DbError::MigrationFailed(format!("Migration v3 failed: {e}")))?;
+
+    Ok(())
+}
+
+/// Migration v4: Add blind code modules and script-code access tables.
+fn migrate_v4(conn: &Connection) -> Result<(), DbError> {
+    let sql = "
+        CREATE TABLE IF NOT EXISTS blind_code_modules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            description TEXT NOT NULL DEFAULT '',
+            encrypted_code BLOB NOT NULL,
+            required_secrets TEXT NOT NULL DEFAULT '[]',
+            allowed_params TEXT NOT NULL DEFAULT '[]',
+            approved INTEGER NOT NULL DEFAULT 0,
+            blind INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            expires_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS script_code_access (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            script_reg_id INTEGER NOT NULL,
+            code_module_id INTEGER NOT NULL,
+            approved INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (script_reg_id) REFERENCES script_registrations(id),
+            FOREIGN KEY (code_module_id) REFERENCES blind_code_modules(id),
+            UNIQUE(script_reg_id, code_module_id)
+        );
+
+        INSERT INTO schema_version (version) VALUES (4);
+    ";
+
+    conn.execute_batch(sql)
+        .map_err(|e| DbError::MigrationFailed(format!("Migration v4 failed: {e}")))?;
+
+    Ok(())
+}
+
+/// Migration v5: Add language column to blind_code_modules for multi-language support.
+fn migrate_v5(conn: &Connection) -> Result<(), DbError> {
+    let sql = "
+        ALTER TABLE blind_code_modules ADD COLUMN language TEXT NOT NULL DEFAULT 'rhai';
+
+        INSERT INTO schema_version (version) VALUES (5);
+    ";
+
+    conn.execute_batch(sql)
+        .map_err(|e| DbError::MigrationFailed(format!("Migration v5 failed: {e}")))?;
 
     Ok(())
 }
